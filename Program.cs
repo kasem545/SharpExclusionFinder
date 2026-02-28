@@ -1,7 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.Eventing.Reader;
 using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -25,6 +28,8 @@ class Program
 
     static bool verbose = false;
 
+    static string scanMethod = "bruteforce"; // bruteforce, eventlog, or both
+
     static StreamWriter logWriter = null;
 
     static readonly object logWriterLock = new object();
@@ -37,9 +42,17 @@ class Program
             return;
         }
 
-        string basePath = args[0];
+        string basePath = null;
+        bool hasBasePath = false;
 
-        for (int i = 1; i < args.Length; i++)
+        // Check if first arg is a path or a flag
+        if (args.Length > 0 && !args[0].StartsWith("-"))
+        {
+            basePath = args[0];
+            hasBasePath = true;
+        }
+
+        for (int i = hasBasePath ? 1 : 0; i < args.Length; i++)
         {
             if (args[i] == "--max-threads" && i + 1 < args.Length)
             {
@@ -62,10 +75,30 @@ class Program
                 outputFile = args[i + 1];
                 i++;
             }
-            else if (args[i] == "-verbose" || args[i] == "--verbose")
+            else if (args[i] == "--verbose")
             {
                 verbose = true;
             }
+            else if (args[i] == "--method" && i + 1 < args.Length)
+            {
+                scanMethod = args[i + 1].ToLower();
+                i++;
+            }
+        }
+
+        // Validate method
+        if (scanMethod != "bruteforce" && scanMethod != "eventlog" && scanMethod != "both")
+        {
+            Console.WriteLine($"Error: Invalid method '{scanMethod}'. Use: bruteforce, eventlog, or both");
+            return;
+        }
+
+        // Validate basePath for bruteforce method
+        if ((scanMethod == "bruteforce" || scanMethod == "both") && string.IsNullOrEmpty(basePath))
+        {
+            Console.WriteLine("Error: Base path required for bruteforce method.");
+            PrintHelp();
+            return;
         }
 
         if (outputFile != null)
@@ -83,7 +116,24 @@ class Program
 
         stopwatch.Start();
 
-        GetExcludedFoldersByTier(basePath, 0);
+        // Run EventLog method
+        if (scanMethod == "eventlog" || scanMethod == "both")
+        {
+            // Scan event logs silently unless verbose debug is needed
+            GetExclusionsFromEventLog();
+            if (scanMethod == "eventlog")
+            {
+                stopwatch.Stop();
+                if (verbose) Console.WriteLine($"Event log scan completed. Total time: {stopwatch.Elapsed.TotalSeconds:F2} seconds.");
+            }
+        }
+
+        // Run BruteForce method
+        if (scanMethod == "bruteforce" || scanMethod == "both")
+        {
+            if (scanMethod == "both" && verbose) Console.WriteLine("\n[*] Starting brute-force scan...");
+            GetExcludedFoldersByTier(basePath, 0);
+        }
 
         if (logWriter != null)
         {
@@ -93,17 +143,245 @@ class Program
 
     static void PrintHelp()
     {
-        Console.WriteLine("Usage: SharpExclusionFinder.exe <BasePath> [options]");
+        Console.WriteLine("Usage: SharpExclusionFinder.exe [<BasePath>] [options]");
         Console.WriteLine("Authors: Hoshea Yarden, Hai Vaknin, Yehuda Smirnov, Noam Pomerantz");
         Console.WriteLine("Options:");
-        Console.WriteLine("  --max-threads N      Set the maximum number of threads (default 3)");
-        Console.WriteLine("  --depth N            Set the maximum directory depth to scan (1 = immediate subdirectories)");
+        Console.WriteLine("  --method <type>      Detection method: bruteforce (default), eventlog, or both");
+        Console.WriteLine("  --max-threads N      Set the maximum number of threads (default 3, bruteforce only)");
+        Console.WriteLine("  --depth N            Set the maximum directory depth to scan (1 = immediate subdirectories, bruteforce only)");
         Console.WriteLine("  --output <filePath>  Specify a file to log exclusions and errors");
-        Console.WriteLine("  -verbose             Show all output (progress, errors). Default: only excluded paths");
+        Console.WriteLine("  --verbose             Show all output (progress, errors). Default: only excluded paths");
         Console.WriteLine("  -h, --help           Display help and usage information");
+        Console.WriteLine("");
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  SharpExclusionFinder.exe --method eventlog");
+        Console.WriteLine("  SharpExclusionFinder.exe C:\\\\Users --method bruteforce");
+        Console.WriteLine("  SharpExclusionFinder.exe C:\\\\Users --method both --verbose");
     }
 
-    // Function to get excluded folders using a tiered approach, with depth limitation
+    // Get exclusions from Windows Defender Event Logs (Event ID 5007)
+    static void GetExclusionsFromEventLog()
+    {
+        try
+        {
+            string logName = "Microsoft-Windows-Windows Defender/Operational";
+            int eventId = 5007;
+
+            EventLogQuery query = new EventLogQuery(logName, PathType.LogName, $"*[System[EventID={eventId}]]");
+            EventLogReader reader = new EventLogReader(query);
+
+            // Patterns to match exclusion registry paths (capture path before the = sign)
+            Regex patternPaths = new Regex(@"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths\\([^=\r\n]+)", RegexOptions.IgnoreCase);
+            Regex patternExtensions = new Regex(@"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Extensions\\([^=\r\n]+)", RegexOptions.IgnoreCase);
+            Regex patternProcesses = new Regex(@"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Processes\\([^=\r\n]+)", RegexOptions.IgnoreCase);
+
+            EventRecord eventRecord;
+            int count = 0;
+            int addedCount = 0;
+            int deletedCount = 0;
+            int modifiedCount = 0;
+            int totalEvents = 0;
+            int exclusionEvents = 0;
+
+            // Store exclusions for table display
+            var exclusionsList = new List<(string action, string type, string path, DateTime timestamp)>();
+
+            while ((eventRecord = reader.ReadEvent()) != null)
+            {
+                totalEvents++;
+                string message = eventRecord.FormatDescription();
+                if (message == null || !message.Contains("Exclusions")) continue;
+
+                exclusionEvents++;
+
+                // Determine if this is an addition or deletion
+                // Format: 
+                //   Addition: "Old value:\n        New value: HKLM\\...\\path = 0x0"
+                //   Deletion: "Old value: HKLM\\...\\path = 0x0\n        New value:"
+                string action = "unknown";
+                string prefix = "[?]";
+
+                // Split message by lines to check Old/New value content
+                string[] lines = message.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+                bool hasContentInOldValue = false;
+                bool hasContentInNewValue = false;
+                bool inOldValueSection = false;
+                bool inNewValueSection = false;
+
+                foreach (string line in lines)
+                {
+                    string trimmed = line.Trim();
+
+                    if (trimmed.StartsWith("Old value:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        inOldValueSection = true;
+                        inNewValueSection = false;
+                        // Check if there's content on the same line
+                        if (trimmed.Length > 10 && trimmed.Contains("Exclusions"))
+                        {
+                            hasContentInOldValue = true;
+                        }
+                    }
+                    else if (trimmed.StartsWith("New value:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        inNewValueSection = true;
+                        inOldValueSection = false;
+                        // Check if there's content on the same line
+                        if (trimmed.Length > 10 && trimmed.Contains("Exclusions"))
+                        {
+                            hasContentInNewValue = true;
+                        }
+                    }
+                    else if (inOldValueSection && trimmed.Contains("Exclusions"))
+                    {
+                        hasContentInOldValue = true;
+                    }
+                    else if (inNewValueSection && trimmed.Contains("Exclusions"))
+                    {
+                        hasContentInNewValue = true;
+                    }
+                }
+
+                // Determine action based on Old/New value content
+                if (hasContentInNewValue && !hasContentInOldValue)
+                {
+                    action = "added";
+                    prefix = "[+]";
+                }
+                else if (hasContentInOldValue && !hasContentInNewValue)
+                {
+                    action = "deleted";
+                    prefix = "[-]";
+                }
+                else if (hasContentInOldValue && hasContentInNewValue)
+                {
+                    action = "modified";
+                    prefix = "[~]";
+                }
+
+                // Show both additions and deletions by default
+
+                // Check for Path exclusions
+                MatchCollection pathMatches = patternPaths.Matches(message);
+                foreach (Match match in pathMatches)
+                {
+                    if (match.Groups.Count > 1)
+                    {
+                        string exclusionPath = match.Groups[1].Value.Trim();
+                        exclusionPath = exclusionPath.Replace("\\\\?\\", "").Trim();
+                        if (!string.IsNullOrWhiteSpace(exclusionPath))
+                        {
+                            exclusionsList.Add((action, "Path", exclusionPath, eventRecord.TimeCreated.Value));
+                            count++;
+                            if (action == "added") addedCount++;
+                            else if (action == "deleted") deletedCount++;
+                            else if (action == "modified") modifiedCount++;
+                        }
+                    }
+                }
+
+                // Check for Extension exclusions
+                MatchCollection extMatches = patternExtensions.Matches(message);
+                foreach (Match match in extMatches)
+                {
+                    if (match.Groups.Count > 1)
+                    {
+                        string exclusionExt = match.Groups[1].Value.Trim();
+                        exclusionExt = exclusionExt.Replace("\\\\?\\", "").Trim();
+                        if (!string.IsNullOrWhiteSpace(exclusionExt))
+                        {
+                            exclusionsList.Add((action, "Extension", exclusionExt, eventRecord.TimeCreated.Value));
+                            count++;
+                            if (action == "added") addedCount++;
+                            else if (action == "deleted") deletedCount++;
+                            else if (action == "modified") modifiedCount++;
+                        }
+                    }
+                }
+
+                // Check for Process exclusions
+                MatchCollection procMatches = patternProcesses.Matches(message);
+                foreach (Match match in procMatches)
+                {
+                    if (match.Groups.Count > 1)
+                    {
+                        string exclusionProc = match.Groups[1].Value.Trim();
+                        exclusionProc = exclusionProc.Replace("\\\\?\\", "").Trim();
+                        if (!string.IsNullOrWhiteSpace(exclusionProc))
+                        {
+                            exclusionsList.Add((action, "Process", exclusionProc, eventRecord.TimeCreated.Value));
+                            count++;
+                            if (action == "added") addedCount++;
+                            else if (action == "deleted") deletedCount++;
+                            else if (action == "modified") modifiedCount++;
+                        }
+                    }
+                }
+            }
+
+            // Sort exclusions by timestamp
+            var sortedExclusions = exclusionsList.OrderBy(x => x.timestamp).ToList();
+
+            // Display as table
+            if (sortedExclusions.Count > 0)
+            {
+                if (verbose && exclusionEvents > 2)
+                {
+                    Console.WriteLine("");
+                }
+
+                // Table header
+                Console.WriteLine(new string('=', 120));
+                Console.WriteLine(string.Format("{0,-10} {1,-12} {2,-70} {3,-25}", "Action", "Type", "Path", "Timestamp"));
+                Console.WriteLine(new string('=', 120));
+
+                // Table rows
+                foreach (var excl in sortedExclusions)
+                {
+                    string actionStr = excl.action == "added" ? "[+] Added" : excl.action == "deleted" ? "[-] Deleted" : "[~] Modified";
+                    string truncatedPath = excl.path.Length > 70 ? excl.path.Substring(0, 67) + "..." : excl.path;
+
+                    ConsoleColor originalColor = Console.ForegroundColor;
+                    if (excl.action == "added")
+                        Console.ForegroundColor = ConsoleColor.Green;
+                    else if (excl.action == "deleted")
+                        Console.ForegroundColor = ConsoleColor.Red;
+                    else if (excl.action == "modified")
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+
+                    Console.WriteLine(string.Format("{0,-10} {1,-12} {2,-70} {3,-25}", actionStr, excl.type, truncatedPath, excl.timestamp.ToString("MM/dd/yyyy hh:mm:ss tt")));
+
+                    Console.ForegroundColor = originalColor;
+
+                    // Log to file
+                    if (logWriter != null)
+                    {
+                        lock (logWriterLock)
+                        {
+                            logWriter.WriteLine(string.Format("{0,-10} {1,-12} {2,-70} {3,-25}", actionStr, excl.type, truncatedPath, excl.timestamp.ToString("MM/dd/yyyy hh:mm:ss tt")));
+                            logWriter.Flush();
+                        }
+                    }
+                }
+
+                Console.WriteLine(new string('=', 120));
+            }
+        }
+        catch (UnauthorizedAccessException)
+        {
+            LogMessage("Error: Access denied to Event Logs. Run as Administrator.", isError: true);
+        }
+        catch (EventLogNotFoundException)
+        {
+            LogMessage("Error: Windows Defender Event Log not found.", isError: true);
+        }
+        catch (Exception ex)
+        {
+            LogMessage($"Error reading Event Logs: {ex.Message}", isError: true);
+        }
+    }
+
     // Normalize path to use consistent separators for HashSet comparison
     static string NormalizePath(string path)
     {
@@ -321,10 +599,26 @@ class Program
         }
     }
 
-    // Function to log messages either to console or output file
-    static void LogMessage(string message, bool isError)
+    // Function to log messages with color based on action
+    static void LogMessageWithColor(string message, string action)
     {
-        if (logWriter != null && (isError || message.Contains("[+] Folder")))
+        // Set color based on action
+        ConsoleColor originalColor = Console.ForegroundColor;
+        if (action == "added")
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+        }
+        else if (action == "deleted")
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+        }
+        else if (action == "modified")
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+        }
+
+        // Log to file if enabled (log all exclusions: added, deleted, modified)
+        if (logWriter != null && (message.Contains("[+]") || message.Contains("[-]") || message.Contains("[~]")))
         {
             lock (logWriterLock)
             {
@@ -333,8 +627,30 @@ class Program
             }
         }
 
-        bool isExclusion = message.Contains("[+] Folder");
-        if (isExclusion || verbose)
+        // Console output with color
+        Console.WriteLine(message);
+
+        // Restore original color
+        Console.ForegroundColor = originalColor;
+    }
+
+
+    // Function to log messages either to console or output file
+    static void LogMessage(string message, bool isError)
+    {
+        // Log to file if enabled (errors and exclusions)
+        if (logWriter != null && (isError || message.Contains("[+]") || message.Contains("[-]") || message.Contains("[~]")))
+        {
+            lock (logWriterLock)
+            {
+                logWriter.WriteLine(message);
+                logWriter.Flush();
+            }
+        }
+
+        // Console output: always show errors and exclusions, or everything if verbose
+        bool isExclusion = message.Contains("[+]") || message.Contains("[-]") || message.Contains("[~]");
+        if (isError || isExclusion || verbose)
         {
             Console.WriteLine(message);
         }
