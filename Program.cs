@@ -11,6 +11,12 @@ using System.Threading.Tasks;
 class Program
 {
     static HashSet<string> excludedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    static readonly HashSet<string> suppressedAccessDeniedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+  {
+    @"d:\\Config.Msi".TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+    @"d:\\Recovery".TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+    @"d:\\System Volume Information".TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+  };
 
     // Counter for progress
     static int counter = 0;
@@ -199,7 +205,6 @@ class Program
                 //   Addition: "Old value:\n        New value: HKLM\\...\\path = 0x0"
                 //   Deletion: "Old value: HKLM\\...\\path = 0x0\n        New value:"
                 string action = "unknown";
-                string prefix = "[?]";
 
                 // Split message by lines to check Old/New value content
                 string[] lines = message.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
@@ -247,17 +252,14 @@ class Program
                 if (hasContentInNewValue && !hasContentInOldValue)
                 {
                     action = "added";
-                    prefix = "[+]";
                 }
                 else if (hasContentInOldValue && !hasContentInNewValue)
                 {
                     action = "deleted";
-                    prefix = "[-]";
                 }
                 else if (hasContentInOldValue && hasContentInNewValue)
                 {
                     action = "modified";
-                    prefix = "[~]";
                 }
 
                 // Show both additions and deletions by default
@@ -388,6 +390,15 @@ class Program
         return Path.GetFullPath(path);
     }
 
+    static bool ShouldSuppressAccessDenied(string directory)
+    {
+        if (string.IsNullOrWhiteSpace(directory))
+            return false;
+
+        string normalized = directory.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return suppressedAccessDeniedDirectories.Contains(normalized);
+    }
+
     static void GetExcludedFoldersByTier(string basePath, int currentDepth)
     {
         if (currentDepth > maxDepth)
@@ -452,7 +463,10 @@ class Program
                 }
                 catch (UnauthorizedAccessException)
                 {
-                    LogMessage($"Access denied to {dir}. Skipping this directory and its subdirectories.", isError: true);
+                    if (!ShouldSuppressAccessDenied(dir))
+                    {
+                        LogMessage($"Access denied to {dir}. Skipping this directory and its subdirectories.", isError: true);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -638,6 +652,12 @@ class Program
     // Function to log messages either to console or output file
     static void LogMessage(string message, bool isError)
     {
+        bool isAccessDeniedMessage = message != null && message.IndexOf("access denied", StringComparison.OrdinalIgnoreCase) >= 0;
+        if (isAccessDeniedMessage)
+        {
+            return;
+        }
+
         // Log to file if enabled (errors and exclusions)
         if (logWriter != null && (isError || message.Contains("[+]") || message.Contains("[-]") || message.Contains("[~]")))
         {
@@ -652,7 +672,30 @@ class Program
         bool isExclusion = message.Contains("[+]") || message.Contains("[-]") || message.Contains("[~]");
         if (isError || isExclusion || verbose)
         {
+            ConsoleColor originalColor = Console.ForegroundColor;
+
+            if (isError)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+            }
+            else if (isExclusion)
+            {
+                if (message.Contains("[+]"))
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                }
+                else if (message.Contains("[-]"))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                }
+                else if (message.Contains("[~]"))
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                }
+            }
+
             Console.WriteLine(message);
+            Console.ForegroundColor = originalColor;
         }
     }
 }
