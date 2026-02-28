@@ -144,7 +144,7 @@ class Program
     static void PrintHelp()
     {
         Console.WriteLine("Usage: SharpExclusionFinder.exe [<BasePath>] [options]");
-        Console.WriteLine("Authors: Hoshea Yarden, Hai Vaknin, Yehuda Smirnov, Noam Pomerantz");
+        Console.WriteLine("Authors: Hoshea Yarden, Hai Vaknin, Yehuda Smirnov, Noam Pomerantz, Kasem545");
         Console.WriteLine("Options:");
         Console.WriteLine("  --method <type>      Detection method: bruteforce (default), eventlog, or both");
         Console.WriteLine("  --max-threads N      Set the maximum number of threads (default 3, bruteforce only)");
